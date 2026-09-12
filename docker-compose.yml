@@ -1,0 +1,14 @@
+# docker compose up --build
+# API at http://localhost:8080/
+services:
+  game-backend:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - game-data:/data
+    restart: unless-stopped
+
+volumes:
+  game-data:
+
