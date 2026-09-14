@@ -7,6 +7,10 @@ A small Flask + sqlite service providing:
     (GK0000-GK9999 -- a GAME prize pool, kept entirely separate from
     ARACHNODE's real client-facing Discernment Key Bank / demo login
     codes, so playing the game never consumes real client credentials)
+  - Discernment Academy: lesson-based Allow/Block/Escalate training
+    scenarios, mirroring real ARACHNODE Agent Security Gateway policy
+    calls, with per-lesson mastery keys and a Master Discernment Key
+    once every seeded lesson has been answered correctly
 
 Run locally:
     pip install -r requirements.txt
@@ -30,6 +34,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 PRIZE_CODE_COUNT = 10000
 VALID_RESULTS = {"WIN", "LOSS"}
+VALID_ACTIONS = {"ALLOW", "BLOCK", "ESCALATE"}
 NAME_RE = re.compile(r"^[A-Za-z0-9 _\-]{1,24}$")
 
 SCHEMA = """
@@ -47,8 +52,143 @@ CREATE TABLE IF NOT EXISTS prize_codes (
     code TEXT PRIMARY KEY,
     claimed_at TEXT
 );
-"""
 
+CREATE TABLE IF NOT EXISTS academy_lessons (
+    lesson_id TEXT PRIMARY KEY,
+    sort_order INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    scenario_text TEXT NOT NULL,
+    policy_text TEXT NOT NULL,
+    correct_action TEXT NOT NULL,
+    explanation TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS academy_progress (
+    player_name TEXT NOT NULL,
+    lesson_id TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    correct INTEGER NOT NULL DEFAULT 0,
+    last_action TEXT,
+    completed_at TEXT,
+    PRIMARY KEY (player_name, lesson_id)
+);
+
+CREATE TABLE IF NOT EXISTS academy_keys (
+    player_name TEXT NOT NULL,
+    lesson_id TEXT NOT NULL,
+    earned_at TEXT NOT NULL,
+    PRIMARY KEY (player_name, lesson_id)
+);
+"""
+# Seed content: real ARACHNODE-style intercepted agent tool calls. Each
+# teaches one Allow / Block / Escalate judgment. Add more rows here as
+# the lesson set grows -- sort_order controls display order, lesson_id
+# must stay stable once players have progress recorded against it.
+ACADEMY_LESSONS = [
+    {
+        "lesson_id": "L01-read-status",
+        "sort_order": 1,
+        "title": "Public Status Page Read",
+        "scenario_text": (
+            "An AI agent calls GET /status on the company's public status "
+            "page to check current uptime before starting a task."
+        ),
+        "policy_text": (
+            "Policy: read-only calls against public, non-sensitive "
+            "endpoints are low risk and do not require review."
+        ),
+        "correct_action": "ALLOW",
+        "explanation": (
+            "Read-only, public data, no side effects -- this is exactly "
+            "the kind of call ARACHNODE's policy engine clears "
+            "automatically so agents aren't slowed down by safe requests."
+        ),
+    },
+    {
+        "lesson_id": "L02-drop-table",
+        "sort_order": 2,
+        "title": "Drop Production Table",
+        "scenario_text": (
+            "An AI agent calls DROP TABLE customers on the production "
+            "database as part of a 'cleanup' task."
+        ),
+        "policy_text": (
+            "Policy: destructive, irreversible operations against "
+            "production data stores are never auto-approved."
+        ),
+        "correct_action": "BLOCK",
+        "explanation": (
+            "Irreversible data loss on production, with no upside that "
+            "justifies the risk. ARACHNODE blocks this outright rather "
+            "than even routing it to a human -- there's no legitimate "
+            "'cleanup' that needs this."
+        ),
+    },
+    {
+        "lesson_id": "L03-restart-staging",
+        "sort_order": 3,
+        "title": "Restart Staging Server",
+        "scenario_text": (
+            "An AI agent calls restart_service('staging-web-01') to "
+            "recover from a crashed process."
+        ),
+        "policy_text": (
+            "Policy: service restarts in non-production environments are "
+            "low risk and reversible."
+        ),
+        "correct_action": "ALLOW",
+        "explanation": (
+            "Staging, not production; a restart is a normal recovery "
+            "action with no lasting impact. Auto-approving keeps agents "
+            "productive on low-stakes infrastructure."
+        ),
+    },
+    {
+        "lesson_id": "L04-adjust-billing",
+        "sort_order": 4,
+        "title": "Adjust Customer Billing",
+        "scenario_text": (
+            "An AI agent calls adjust_balance(customer_id, -500.00) to "
+            "issue what it determined was an appropriate refund."
+        ),
+        "policy_text": (
+            "Policy: direct financial adjustments to customer accounts "
+            "require human sign-off, even when the agent's reasoning "
+            "looks sound."
+        ),
+        "correct_action": "ESCALATE",
+        "explanation": (
+            "Real money, real customer impact, and the agent's judgment "
+            "hasn't been verified by a person. This is the textbook case "
+            "for the Master Discernment Key human-approval step -- not an "
+            "auto-block, since the refund may well be legitimate, but not "
+            "an auto-allow either."
+        ),
+    },
+    {
+        "lesson_id": "L05-export-pii",
+        "sort_order": 5,
+        "title": "Export Customer PII Externally",
+        "scenario_text": (
+            "An AI agent calls export_customers(format='csv', "
+            "destination='external-partner@example.com') to share a "
+            "full customer data export."
+        ),
+        "policy_text": (
+            "Policy: bulk export of personally identifiable information "
+            "to an external destination is treated as a potential "
+            "exfiltration event."
+        ),
+        "correct_action": "BLOCK",
+        "explanation": (
+            "Bulk PII leaving the company to an external address is "
+            "exactly the pattern ARACHNODE watches for, whether the "
+            "agent's intent was benign or not. Block first; a legitimate "
+            "data-sharing need goes through a separate, audited process "
+            "-- not an agent's unilateral tool call."
+        ),
+    },
+]
 _db_lock = threading.Lock()
 
 
@@ -81,9 +221,35 @@ def ensure_prize_codes_seeded():
         db.close()
 
 
+def ensure_academy_lessons_seeded():
+    """Idempotent: inserts/updates the seed lesson set by lesson_id.
+    Safe to redeploy after editing ACADEMY_LESSONS above -- existing
+    player progress (keyed by lesson_id) is untouched."""
+    with _db_lock:
+        db = get_db()
+        db.executemany(
+            "INSERT INTO academy_lessons "
+            "(lesson_id, sort_order, title, scenario_text, policy_text, correct_action, explanation) "
+            "VALUES (:lesson_id, :sort_order, :title, :scenario_text, :policy_text, :correct_action, :explanation) "
+            "ON CONFLICT(lesson_id) DO UPDATE SET "
+            "sort_order=excluded.sort_order, title=excluded.title, "
+            "scenario_text=excluded.scenario_text, policy_text=excluded.policy_text, "
+            "correct_action=excluded.correct_action, explanation=excluded.explanation",
+            ACADEMY_LESSONS,
+        )
+        db.commit()
+        db.close()
+
+
 def _now() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
+
+def _clean_player_name(raw) -> str:
+    player_name = str(raw or "").strip() or "ANON"
+    if not NAME_RE.match(player_name):
+        player_name = re.sub(r"[^A-Za-z0-9 _\-]", "", player_name)[:24] or "ANON"
+    return player_name
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -103,6 +269,7 @@ def create_app() -> Flask:
 
     init_db()
     ensure_prize_codes_seeded()
+    ensure_academy_lessons_seeded()
 
     @app.get("/health")
     def health():
@@ -112,9 +279,7 @@ def create_app() -> Flask:
     def submit_score():
         payload = request.get_json(silent=True) or {}
 
-        player_name = str(payload.get("player_name", "")).strip() or "ANON"
-        if not NAME_RE.match(player_name):
-            player_name = re.sub(r"[^A-Za-z0-9 _\-]", "", player_name)[:24] or "ANON"
+        player_name = _clean_player_name(payload.get("player_name"))
 
         try:
             score = int(payload.get("score", 0))
@@ -196,6 +361,102 @@ def create_app() -> Flask:
         db.close()
         return jsonify({"total": row["total"], "unclaimed": row["unclaimed"] or 0})
 
+    # ---- Discernment Academy -------------------------------------------
+
+    @app.get("/academy/lessons")
+    def academy_lessons():
+        """Lesson list for the front end. correct_action and explanation
+        are withheld here on purpose -- they're only revealed in the
+        response to POST /academy/progress, after the player answers."""
+        db = get_db()
+        rows = db.execute(
+            "SELECT lesson_id, sort_order, title, scenario_text, policy_text "
+            "FROM academy_lessons ORDER BY sort_order ASC"
+        ).fetchall()
+        db.close()
+        return jsonify([dict(r) for r in rows])
+
+    @app.post("/academy/progress")
+    def academy_progress():
+        payload = request.get_json(silent=True) or {}
+
+        player_name = _clean_player_name(payload.get("player_name"))
+        lesson_id = str(payload.get("lesson_id", "")).strip()
+        chosen_action = str(payload.get("chosen_action", "")).upper().strip()
+
+        if chosen_action not in VALID_ACTIONS:
+            return jsonify({"error": f"chosen_action must be one of {sorted(VALID_ACTIONS)}"}), 400
+
+        db = get_db()
+        lesson = db.execute(
+            "SELECT lesson_id, correct_action, explanation FROM academy_lessons WHERE lesson_id = ?",
+            (lesson_id,),
+        ).fetchone()
+        if lesson is None:
+            db.close()
+            return jsonify({"error": "unknown lesson_id"}), 404
+
+        is_correct = chosen_action == lesson["correct_action"]
+        key_earned_now = False
+
+        with _db_lock:
+            db.execute(
+                "INSERT INTO academy_progress (player_name, lesson_id, attempts, correct, last_action, completed_at) "
+                "VALUES (?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(player_name, lesson_id) DO UPDATE SET "
+                "attempts = attempts + 1, "
+                "correct = MAX(correct, excluded.correct), "
+                "last_action = excluded.last_action, "
+                "completed_at = CASE WHEN excluded.correct = 1 THEN excluded.completed_at ELSE completed_at END",
+                (player_name, lesson_id, int(is_correct), chosen_action, _now() if is_correct else None),
+            )
+
+            if is_correct:
+                existing_key = db.execute(
+                    "SELECT 1 FROM academy_keys WHERE player_name = ? AND lesson_id = ?",
+                    (player_name, lesson_id),
+                ).fetchone()
+                if existing_key is None:
+                    db.execute(
+                        "INSERT INTO academy_keys (player_name, lesson_id, earned_at) VALUES (?, ?, ?)",
+                        (player_name, lesson_id, _now()),
+                    )
+                    key_earned_now = True
+
+            db.commit()
+            db.close()
+
+        mastery = _mastery_summary(player_name)
+
+        return jsonify(
+            {
+                "correct": is_correct,
+                "correct_action": lesson["correct_action"],
+                "explanation": lesson["explanation"],
+                "key_earned_this_attempt": key_earned_now,
+                "mastery": mastery,
+            }
+        )
+
+    @app.get("/academy/mastery")
+    def academy_mastery():
+        player_name = _clean_player_name(request.args.get("player_name"))
+        return jsonify(_mastery_summary(player_name))
+
+    def _mastery_summary(player_name: str) -> dict:
+        db = get_db()
+        total_lessons = db.execute("SELECT COUNT(*) AS n FROM academy_lessons").fetchone()["n"]
+        keys_earned = db.execute(
+            "SELECT COUNT(*) AS n FROM academy_keys WHERE player_name = ?", (player_name,)
+        ).fetchone()["n"]
+        db.close()
+        return {
+            "player_name": player_name,
+            "total_lessons": total_lessons,
+            "keys_earned": keys_earned,
+            "master_discernment_key_earned": total_lessons > 0 and keys_earned >= total_lessons,
+        }
+
     return app
 
 
@@ -203,4 +464,3 @@ app = create_app()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
-
